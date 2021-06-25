@@ -13,7 +13,7 @@ use crate::error::{DexErrorCode, DexResult, SourceFileId};
 use crate::{
     critbit::{LeafNode, NodeHandle, Slab, SlabView},
     fees::{self, FeeTier},
-    state::{Event, EventQueue, EventView, MarketState, OpenOrders, RequestView},
+    state::{Event, EventQueue, EventView, MarketStateInner, OpenOrders, RequestView},
 };
 
 #[cfg(not(feature = "program"))]
@@ -53,7 +53,7 @@ pub struct OrderBookState<'a> {
     // first byte of a key is 0xaa or 0xbb, disambiguating bids and asks
     pub bids: &'a mut Slab,
     pub asks: &'a mut Slab,
-    pub market_state: &'a mut MarketState,
+    pub market_state: &'a mut MarketStateInner,
 }
 
 impl<'ob> OrderBookState<'ob> {

@@ -1,7 +1,8 @@
 #![cfg_attr(not(feature = "program"), allow(unused))]
 use num_enum::TryFromPrimitive;
 use std::{
-    cell::RefMut, convert::identity, convert::TryInto, mem::size_of, num::NonZeroU64, ops::DerefMut,
+    cell::RefMut, convert::identity, convert::TryInto, mem::size_of, num::NonZeroU64, ops::Deref,
+    ops::DerefMut,
 };
 
 use arrayref::{array_ref, array_refs, mut_array_refs};
@@ -63,10 +64,29 @@ pub enum AccountFlag {
     Closed = 1u64 << 8,
 }
 
+pub struct MarketState<'a> {
+    pub inner: RefMut<'a, MarketStateInner>,
+    pub authority: [u64; 4],
+}
+
+impl<'a> Deref for MarketState<'a> {
+    type Target = MarketStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a> DerefMut for MarketState<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.deref_mut()
+    }
+}
+
 #[derive(Copy, Clone)]
 #[cfg_attr(target_endian = "little", derive(Debug))]
 #[repr(packed)]
-pub struct MarketState {
+pub struct MarketStateInner {
     // 0
     pub account_flags: u64, // Initialized, Market
 
@@ -117,12 +137,13 @@ pub struct MarketState {
     // 46
     pub referrer_rebates_accrued: u64,
 }
+
 #[cfg(target_endian = "little")]
-unsafe impl Zeroable for MarketState {}
+unsafe impl Zeroable for MarketStateInner {}
 #[cfg(target_endian = "little")]
-unsafe impl Pod for MarketState {}
+unsafe impl Pod for MarketStateInner {}
 #[cfg(target_endian = "little")]
-unsafe impl TriviallyTransmutable for MarketState {}
+unsafe impl TriviallyTransmutable for MarketStateInner {}
 
 pub const ACCOUNT_HEAD_PADDING: &[u8; 5] = b"serum";
 pub const ACCOUNT_TAIL_PADDING: &[u8; 7] = b"padding";
@@ -189,24 +210,21 @@ pub fn strip_header<'a, H: Pod, D: Pod>(
     Ok((header, inner))
 }
 
-impl MarketState {
+impl<'a> MarketState<'a> {
     #[inline]
-    pub fn load<'a>(
-        market_account: &'a AccountInfo,
-        program_id: &Pubkey,
-    ) -> DexResult<RefMut<'a, Self>> {
+    pub fn load(market_account: &'a AccountInfo, program_id: &Pubkey) -> DexResult<Self> {
         check_assert_eq!(market_account.owner, program_id)?;
-        let mut account_data: RefMut<'a, [u8]>;
-        let state: RefMut<'a, Self>;
 
+        let mut account_data: RefMut<'a, [u8]>;
         account_data = RefMut::map(market_account.try_borrow_mut_data()?, |data| *data);
         check_account_padding(&mut account_data)?;
-        state = RefMut::map(account_data, |data| {
+        let inner: RefMut<'a, MarketStateInner> = RefMut::map(account_data, |data| {
             from_bytes_mut(cast_slice_mut(
                 check_account_padding(data).unwrap_or_else(|_| unreachable!()),
             ))
         });
-
+        let authority = [0u64; 4];
+        let state: MarketState<'a> = MarketState { inner, authority };
         state.check_flags()?;
         Ok(state)
     }
@@ -222,12 +240,13 @@ impl MarketState {
         Ok(())
     }
 
-    pub fn load_orders_mut<'a>(
+    pub fn load_orders_mut(
         &self,
         orders_account: &'a AccountInfo,
         owner_account: Option<&AccountInfo>,
         program_id: &Pubkey,
         rent: Option<Rent>,
+        authority: Option<account_parser::SignerAccount>,
     ) -> DexResult<RefMut<'a, OpenOrders>> {
         check_assert_eq!(orders_account.owner, program_id)?;
         let mut open_orders: RefMut<'a, OpenOrders>;
@@ -238,6 +257,14 @@ impl MarketState {
         open_orders = RefMut::map(data, |data| from_bytes_mut(data));
 
         if open_orders.account_flags == 0 {
+            // If the market has an authority
+            let has_authority = self.authority == [0u64; 4];
+            /*
+            if has_authority && Some(self.authority) != authority.map(|a| a.key.to_aligned_bytes())
+            {
+                // todo
+            }
+                         */
             let rent = rent.ok_or(DexErrorCode::RentNotProvided)?;
             let owner_account = owner_account.ok_or(DexErrorCode::OwnerAccountNotProvided)?;
             if !rent.is_exempt(open_orders_lamports, open_orders_data_len) {
@@ -259,7 +286,7 @@ impl MarketState {
         Ok(open_orders)
     }
 
-    fn load_bids_mut<'a>(&self, bids: &'a AccountInfo) -> DexResult<RefMut<'a, Slab>> {
+    fn load_bids_mut(&self, bids: &'a AccountInfo) -> DexResult<RefMut<'a, Slab>> {
         check_assert_eq!(&bids.key.to_aligned_bytes(), &identity(self.bids))
             .map_err(|_| DexErrorCode::WrongBidsAccount)?;
         let (header, buf) = strip_header::<OrderBookStateHeader, u8>(bids, false)?;
@@ -268,7 +295,7 @@ impl MarketState {
         Ok(RefMut::map(buf, Slab::new))
     }
 
-    fn load_asks_mut<'a>(&self, asks: &'a AccountInfo) -> DexResult<RefMut<'a, Slab>> {
+    fn load_asks_mut(&self, asks: &'a AccountInfo) -> DexResult<RefMut<'a, Slab>> {
         check_assert_eq!(&asks.key.to_aligned_bytes(), &identity(self.asks))
             .map_err(|_| DexErrorCode::WrongAsksAccount)?;
         let (header, buf) = strip_header::<OrderBookStateHeader, u8>(asks, false)?;
@@ -277,7 +304,7 @@ impl MarketState {
         Ok(RefMut::map(buf, Slab::new))
     }
 
-    fn load_request_queue_mut<'a>(&self, queue: &'a AccountInfo) -> DexResult<RequestQueue<'a>> {
+    fn load_request_queue_mut(&self, queue: &'a AccountInfo) -> DexResult<RequestQueue<'a>> {
         check_assert_eq!(&queue.key.to_aligned_bytes(), &identity(self.req_q))
             .map_err(|_| DexErrorCode::WrongRequestQueueAccount)?;
 
@@ -290,7 +317,7 @@ impl MarketState {
         Ok(Queue { header, buf })
     }
 
-    fn load_event_queue_mut<'a>(&self, queue: &'a AccountInfo) -> DexResult<EventQueue<'a>> {
+    fn load_event_queue_mut(&self, queue: &'a AccountInfo) -> DexResult<EventQueue<'a>> {
         check_assert_eq!(&queue.key.to_aligned_bytes(), &identity(self.event_q))
             .map_err(|_| DexErrorCode::WrongEventQueueAccount)?;
         let (header, buf) = strip_header::<EventQueueHeader, Event>(queue, false)?;
@@ -1428,8 +1455,13 @@ pub(crate) mod account_parser {
         ) -> DexResult<Self> {
             check_assert_eq!(accounts.len(), 10)?;
             let accounts = array_ref![accounts, 0, 10];
-            let (unchecked_serum_dex_accounts, unchecked_vaults, unchecked_mints, unchecked_rent) =
-                array_refs![accounts, 5, 2, 2, 1];
+            let (
+                unchecked_serum_dex_accounts,
+                unchecked_vaults,
+                unchecked_mints,
+                unchecked_rent,
+                //                authority_maybe, todo
+            ) = array_refs![accounts, 5, 2, 2, 1];
 
             {
                 let rent_sysvar = RentSysvarAccount::new(&unchecked_rent[0])?;
@@ -1555,7 +1587,7 @@ pub(crate) mod account_parser {
                 _ => check_unreachable!()?,
             };
 
-            let mut market: RefMut<'a, MarketState> = MarketState::load(market_acc, program_id)?;
+            let mut market = MarketState::load(market_acc, program_id)?;
 
             let signer = SignerAccount::new(signer_acc)?;
             let fee_tier = market
@@ -1620,8 +1652,12 @@ pub(crate) mod account_parser {
             f: impl FnOnce(NewOrderV3Args) -> DexResult<T>,
         ) -> DexResult<T> {
             const MIN_ACCOUNTS: usize = 12;
-            check_assert!(accounts.len() == MIN_ACCOUNTS || accounts.len() == MIN_ACCOUNTS + 1)?;
-            let (fixed_accounts, fee_discount_account): (
+            check_assert!(
+                accounts.len() == MIN_ACCOUNTS
+                    || accounts.len() == MIN_ACCOUNTS + 1
+                    || accounts.len() == MIN_ACCOUNTS + 2
+            )?;
+            let (fixed_accounts, remaining_accounts): (
                 &'a [AccountInfo<'b>; MIN_ACCOUNTS],
                 &'a [AccountInfo<'b>],
             ) = array_refs![accounts, MIN_ACCOUNTS; .. ;];
@@ -1639,13 +1675,17 @@ pub(crate) mod account_parser {
                 ref spl_token_program_acc,
                 ref rent_sysvar_acc,
             ]: &'a [AccountInfo<'b>; MIN_ACCOUNTS] = fixed_accounts;
-            let srm_or_msrm_account = match fee_discount_account {
-                &[] => None,
-                &[ref account] => Some(TokenAccount::new(account)?),
+            let (srm_or_msrm_account, authority_account) = match remaining_accounts {
+                &[] => (None, None),
+                &[ref account] => (Some(TokenAccount::new(account)?), None),
+                &[ref srm_or_msrm_account, ref authority_account] => (
+                    Some(TokenAccount::new(srm_or_msrm_account)?),
+                    Some(SignerAccount::new(authority_account)),
+                ),
                 _ => check_unreachable!()?,
             };
 
-            let mut market: RefMut<'a, MarketState> = MarketState::load(market_acc, program_id)?;
+            let mut market = MarketState::load(market_acc, program_id)?;
             let rent = {
                 let rent_sysvar = RentSysvarAccount::new(rent_sysvar_acc)?;
                 Rent::from_account_info(rent_sysvar.inner()).or(check_unreachable!())?
@@ -1653,11 +1693,13 @@ pub(crate) mod account_parser {
             let owner = SignerAccount::new(owner_acc)?;
             let fee_tier =
                 market.load_fee_tier(&owner.inner().key.to_aligned_bytes(), srm_or_msrm_account)?;
+            let authority_account = None; // TODO
             let mut open_orders = market.load_orders_mut(
                 open_orders_acc,
                 Some(owner.inner()),
                 program_id,
                 Some(rent),
+                authority_account,
             )?;
             let open_orders_address = open_orders_acc.key.to_aligned_bytes();
             let req_q = market.load_request_queue_mut(req_q_acc)?;
@@ -1704,7 +1746,7 @@ pub(crate) mod account_parser {
         pub limit: u16,
         pub program_id: &'a Pubkey,
         pub open_orders_accounts: &'a [AccountInfo<'b>],
-        pub market: &'a mut MarketState,
+        pub market: MarketState<'a>,
         pub event_q: EventQueue<'a>,
     }
     impl<'a, 'b: 'a> ConsumeEventsArgs<'a, 'b> {
@@ -1729,7 +1771,7 @@ pub(crate) mod account_parser {
                 limit,
                 program_id,
                 open_orders_accounts,
-                market: market.deref_mut(),
+                market,
                 event_q,
             };
             f(args)
@@ -1769,6 +1811,7 @@ pub(crate) mod account_parser {
                 open_orders_acc,
                 Some(open_orders_signer.inner()),
                 program_id,
+                None,
                 None,
             )?;
             let open_orders_address = open_orders_acc.key.to_aligned_bytes();
@@ -1832,6 +1875,7 @@ pub(crate) mod account_parser {
                 Some(open_orders_signer.inner()),
                 program_id,
                 None,
+                None,
             )?;
             let open_orders_address = open_orders_acc.key.to_aligned_bytes();
 
@@ -1859,7 +1903,7 @@ pub(crate) mod account_parser {
     }
 
     pub struct SettleFundsArgs<'a, 'b: 'a> {
-        pub market: &'a mut MarketState,
+        pub market: MarketState<'a>,
         pub open_orders: &'a mut OpenOrders,
         pub coin_vault: CoinVault<'a, 'b>,
         pub pc_vault: PcVault<'a, 'b>,
@@ -1910,11 +1954,16 @@ pub(crate) mod account_parser {
 
             let vault_signer = VaultSigner::new(vault_signer_acc, &market, program_id)?;
 
-            let mut open_orders =
-                market.load_orders_mut(open_orders_acc, Some(owner.inner()), program_id, None)?;
+            let mut open_orders = market.load_orders_mut(
+                open_orders_acc,
+                Some(owner.inner()),
+                program_id,
+                None,
+                None,
+            )?;
 
             let args = SettleFundsArgs {
-                market: market.deref_mut(),
+                market,
                 open_orders: open_orders.deref_mut(),
                 coin_vault,
                 pc_vault,
@@ -1929,7 +1978,7 @@ pub(crate) mod account_parser {
     }
 
     pub struct DisableMarketArgs<'a, 'b: 'a> {
-        pub market: &'a mut MarketState,
+        pub market: &'a mut MarketStateInner,
         pub authorization: SigningDisableAuthority<'a, 'b>,
     }
     impl<'a, 'b: 'a> DisableMarketArgs<'a, 'b> {
@@ -1952,7 +2001,7 @@ pub(crate) mod account_parser {
     }
 
     pub struct SweepFeesArgs<'a, 'b: 'a> {
-        pub market: &'a mut MarketState,
+        pub market: MarketState<'a>,
         pub pc_vault: PcVault<'a, 'b>,
         pub fee_receiver: PcWallet<'a, 'b>,
         pub vault_signer: VaultSigner<'a, 'b>,
@@ -1984,7 +2033,7 @@ pub(crate) mod account_parser {
             let authorization = SigningFeeSweeper::new(sweep_authority_acc)?;
 
             let args = SweepFeesArgs {
-                market: market.deref_mut(),
+                market,
                 pc_vault,
                 fee_receiver,
                 vault_signer,
@@ -2019,9 +2068,14 @@ pub(crate) mod account_parser {
 
             // Validate the accounts given are valid.
             let owner = SignerAccount::new(owner_acc)?;
-            let market: RefMut<'a, MarketState> = MarketState::load(market_acc, program_id)?;
-            let mut open_orders =
-                market.load_orders_mut(open_orders_acc, Some(owner.inner()), program_id, None)?;
+            let market = MarketState::load(market_acc, program_id)?;
+            let mut open_orders = market.load_orders_mut(
+                open_orders_acc,
+                Some(owner.inner()),
+                program_id,
+                None,
+                None,
+            )?;
 
             // Only accounts with no funds associated with them can be closed.
             if open_orders.free_slot_bits != std::u128::MAX {
@@ -2081,6 +2135,7 @@ pub(crate) mod account_parser {
                 Some(owner.inner()),
                 program_id,
                 Some(rent),
+                None, // TODO
             )?;
 
             // Invoke processor.
@@ -2233,7 +2288,7 @@ impl State {
     #[cfg(feature = "program")]
     fn process_settle_funds(args: account_parser::SettleFundsArgs) -> DexResult {
         let account_parser::SettleFundsArgs {
-            market,
+            mut market,
             mut open_orders,
             coin_vault,
             pc_vault,
@@ -2383,9 +2438,13 @@ impl State {
                 .binary_search_by_key(&owner, |account_info| account_info.key.to_aligned_bytes());
             let mut open_orders: RefMut<OpenOrders> = match owner_index {
                 Err(_) => break,
-                Ok(i) => {
-                    market.load_orders_mut(&open_orders_accounts[i], None, program_id, None)?
-                }
+                Ok(i) => market.load_orders_mut(
+                    &open_orders_accounts[i],
+                    None,
+                    program_id,
+                    None,
+                    None,
+                )?,
             };
 
             check_assert!(event.owner_slot < 128)?;
@@ -2755,9 +2814,9 @@ impl State {
         // initialize market
         let mut market_data = market.try_borrow_mut_data()?;
         let market_view = init_account_padding(&mut market_data)?;
-        let market_hdr: &mut MarketState =
+        let market_hdr: &mut MarketStateInner =
             try_from_bytes_mut(cast_slice_mut(market_view)).or(check_unreachable!())?;
-        *market_hdr = MarketState {
+        *market_hdr = MarketStateInner {
             coin_lot_size,
             pc_lot_size,
             own_address: market.key.to_aligned_bytes(),
